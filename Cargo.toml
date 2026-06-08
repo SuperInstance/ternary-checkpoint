@@ -1,10 +1,13 @@
 [package]
+rust-version = "1.70"
+readme = "README.md"
 name = "ternary-checkpoint"
 version = "0.1.0"
 edition = "2021"
 description = "Ternary model checkpointing with compression and integrity"
 license = "MIT"
 repository = "https://github.com/SuperInstance/ternary-checkpoint"
+documentation = "https://docs.rs/ternary-checkpoint"
 
 [dependencies]
 ternary-types = { git = "https://github.com/SuperInstance/ternary-types.git", features = ["std"] }
