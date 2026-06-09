@@ -5,3 +5,11 @@ version = 4
 [[package]]
 name = "ternary-checkpoint"
 version = "0.1.0"
+dependencies = [
+ "ternary-types",
+]
+
+[[package]]
+name = "ternary-types"
+version = "0.2.0"
+source = "git+https://github.com/SuperInstance/ternary-types.git#5305147151f54ddc622df52dcd2a03fc12354bb9"

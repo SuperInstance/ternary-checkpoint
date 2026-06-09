@@ -1,10 +1,54 @@
 //! # ternary-checkpoint
 //!
-//! Model checkpointing optimized for ternary networks.
-//! Trits pack 16 to a u32 (2 bits each), giving 16× compression over float32.
+//! **Ternary model checkpointing with 16× compression and integrity verification.**
 //!
-//! Connected to the [`ternary-types`](https://github.com/SuperInstance/ternary-types)
-//! fleet via its dependency.
+//! Neural networks with ternary weights (−1, 0, +1) need only 2 bits per weight to store
+//! losslessly. This crate packs 16 trits into a single `u32`, achieving a 16× compression
+//! ratio over float32 — with perfect round-trip fidelity verified by
+//! [`verify_integrity`].
+//!
+//! # Packing Scheme
+//!
+//! | Trit | Binary | Meaning            |
+//! |------|--------|--------------------|
+//! | −1   | `00`   | Negative connection|
+//! |  0   | `01`   | Pruned / inactive  |
+//! | +1   | `10`   | Positive connection|
+//! |  —   | `11`   | Invalid (unused)   |
+//!
+//! # Quick Example
+//!
+//! ```
+//! use ternary_checkpoint::*;
+//!
+//! // Pack a weight matrix
+//! let weights = vec![
+//!     vec![-1_i8, 0, 1],
+//!     vec![1_i8, -1, 0],
+//! ];
+//! let compressed = pack_matrix(&weights);
+//!
+//! // Verify lossless round-trip
+//! let restored = unpack_matrix(&compressed, 2, 3);
+//! assert_eq!(weights, restored);
+//!
+//! // Check compression ratio — 6 trits pack into 1 u32 (24 bytes → 4 bytes)
+//! let ratio = compression_ratio(6 * 4, compressed.len() * 4); // float32 vs packed
+//! assert!(ratio > 5.0);
+//! ```
+//!
+//! # Key Functions
+//!
+//! - [`pack_trits`] / [`unpack_trits`] — Pack/unpack ≤16 trits per `u32`
+//! - [`pack_matrix`] / [`unpack_matrix`] — Full weight matrix compression
+//! - [`verify_integrity`] — Lossless round-trip verification
+//! - [`keep_top_k`] — Sparsify by keeping only top-k magnitude weights
+//! - [`compression_ratio`] — Compute compression ratio
+//!
+//! # Ecosystem
+//!
+//! Part of the [SuperInstance](https://github.com/SuperInstance) ecosystem.
+//! Depends on [`ternary-types`](https://github.com/SuperInstance/ternary-types) for shared type definitions.
 
 /// A single ternary value: -1, 0, or +1.
 pub type Trit = i8;

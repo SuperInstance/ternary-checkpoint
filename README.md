@@ -1,76 +1,225 @@
 # ternary-checkpoint
 
-*Model checkpointing for ternary networks. 16 trits pack into a single u32 — checkpoints are 16× smaller than float32.*
+**Ternary model checkpointing with 16× compression and integrity verification.**
 
-## Why This Exists
+Neural networks with ternary weights — where each weight is exactly −1, 0, or +1 — are the backbone of efficient edge inference. But checkpointing them as 32-bit floats wastes 30 out of every 32 bits. Every weight *can only be three things*, yet we store it like it could be anything.
 
-Saving model checkpoints is boring until your model has 1.7 billion parameters and you're training on 8 GPUs. A float32 checkpoint for that model is 6.8 GB. A ternary checkpoint? 425 MB. The difference isn't just storage — it's network transfer time during distributed training, and it's the ability to keep more checkpoint history for rollback.
+`ternary-checkpoint` exploits this with a simple but powerful insight: **2 bits can represent 4 values, and ternary only needs 3**. So we pack 16 trits into a single `u32`, achieving a 16× compression ratio over `float32` — losslessly. Every `-1`, `0`, and `+1` round-trips perfectly through pack → unpack → verify.
 
-This crate handles the full cycle: pack ternary weights into compact u32 arrays, serialize checkpoints with metadata (epoch, loss, optimizer state references), and restore them with integrity verification.
+## The Insight: Ternary Weights Are Already Compressed in Meaning
+
+A ternary network doesn't have 4,294,967,296 possible values per weight like a float32. It has **3**. The information content per weight is log₂(3) ≈ 1.585 bits. Storing that in 32 bits is 20× over-provisioned.
+
+The packing scheme uses 2 bits per trit:
+
+| Trit | Binary | Meaning |
+|------|--------|---------|
+| −1 | `00` | Negative connection |
+| 0 | `01` | No connection (pruned) |
+| +1 | `10` | Positive connection |
+| — | `11` | Invalid (unused) |
+
+This wastes 1 of 4 codes per trit (25% overhead), but keeps packing and unpacking to simple bit shifts — no lookup tables, no branching, just `|=` and `>>`. On a 64-bit system, you can even extend to 32 trits per `u64` for further batching.
 
 ## Architecture
 
 ```
-Ternary Weights: [-1, 0, 1, -1, 1, 0, ...] 
-                       ↓ pack_trits_batch()
-Packed: [0b01_10_01_00_10_01_00_10_01_00_10_01_00_10_01_00_10, ...]
-                       ↓ Checkpoint::new()
-Checkpoint { epoch: 42, loss: 0.003, weights: packed, hash: ... }
-                       ↓ serialize()
-Bytes: [compact binary format with header]
+┌─────────────────────────────────────────────────────┐
+│              Ternary Weight Matrix                   │
+│  [[-1, 0, 1], [1, -1, 0], [0, 1, -1], ...]         │
+│  rows × cols trits                                   │
+└─────────────────────┬───────────────────────────────┘
+                      │
+                      ▼
+            ┌─────────────────┐
+            │  pack_matrix()  │  Flatten → chunk(16) → pack_trits()
+            │  16 trits/u32   │
+            └────────┬────────┘
+                     │
+                     ▼
+          ┌──────────────────────┐
+          │  Compressed Checkpoint│  Vec<u32>, 16× smaller than f32
+          │  [0xABCD1234, ...]   │
+          └──────────┬───────────┘
+                     │
+           ┌─────────┴─────────┐
+           ▼                   ▼
+   ┌───────────────┐   ┌────────────────┐
+   │  Verify       │   │  Unpack        │
+   │  Integrity    │   │  Matrix        │
+   │  (repack +    │   │  (u32 → trits  │
+   │   compare)    │   │   → rows)      │
+   └───────────────┘   └────────────────┘
 ```
 
-### Key Types
+## Quick Start
 
-- **`pack_trits(trits)`** — Pack up to 16 trits into one u32 (2 bits per trit: -1→00, 0→01, +1→10)
-- **`pack_trits_batch(trits)`** — Pack arbitrary-length trit slices into Vec<u32>
-- **`unpack_trits(packed, n)`** — Recover n trits from packed representation
-- **`Checkpoint`** — Serialized snapshot with epoch, loss, packed weights, and integrity hash
-- **`CheckpointManager`** — Manage multiple checkpoints with rotation (keep last N)
-
-### Packing Format
-
+```toml
+[dependencies]
+ternary-checkpoint = "0.1"
 ```
-Trit  -1 = 0b00
-Trit   0 = 0b01
-Trit  +1 = 0b10
-Padding  = 0b11 (only in final u32 if length not multiple of 16)
-```
-
-This format is intentionally the same as `ternary-pack` — checkpoints are compatible with the runtime packing system.
-
-## Usage
 
 ```rust
 use ternary_checkpoint::*;
 
-let weights: Vec<i8> = vec![-1, 0, 1, -1, 1, 0, 0, 1, -1, 1, 0, -1, 1, 0, -1, 1];
+fn main() {
+    // A small ternary weight matrix
+    let weights = vec![
+        vec![-1, 0, 1],
+        vec![1, -1, 0],
+        vec![0, 1, -1],
+    ];
 
-// Pack for storage
-let packed = pack_trits_batch(&weights);
-assert_eq!(packed.len(), 1); // 16 trits = 1 u32
+    // Pack into compressed form (16 trits per u32)
+    let compressed = pack_matrix(&weights);
+    println!("Packed {} trits into {} u32s", 9, compressed.len());
 
-// Create checkpoint
-let ckpt = Checkpoint::new(42, 0.003, &weights);
-assert_eq!(ckpt.epoch, 42);
+    // Verify integrity (lossless round-trip)
+    assert!(verify_integrity(
+        &[−1, 0, 1, 1, −1, 0, 0, 1, −1],
+        &compressed,
+    ));
 
-// Unpack and verify
-let restored = unpack_trits(&packed, weights.len());
-assert_eq!(restored, weights);
+    // Unpack back to matrix
+    let restored = unpack_matrix(&compressed, 3, 3);
+    assert_eq!(weights, restored);
+    println!("Round-trip verified: lossless compression!");
+}
 ```
 
-## The Deeper Idea
+## Tutorial
 
-Checkpoint compression is where ternary networks quietly win. Everyone talks about 16× inference speedup from XNOR+popcount. But 16× checkpoint compression means:
-- 16× more checkpoints in the same disk space
-- 16× faster checkpoint transfer between nodes
-- Rollback granularity that's actually useful
+### Packing Individual Trits
 
-When training runs cost thousands of dollars, being able to keep every checkpoint instead of every 10th checkpoint isn't a nice-to-have. It's the difference between "we lost that run" and "we rolled back to step 42."
+The fundamental operation packs up to 16 trits into a single `u32`:
 
-## Related Crates
+```rust
+use ternary_checkpoint::*;
 
-- `ternary-pack` — Runtime packing (same format, different API)
-- `ternary-accumulator` — Gradient accumulation during training
-- `ternary-distill` — Knowledge distillation for ternary models
-- `ternary-prune` — Pruning to ternary from float weights
+let trits = vec![-1, 0, 1, -1, 0, 1, -1, 1, 0, 0, 1, -1, 1, -1, 0, 1];
+let packed = pack_trits(&trits);  // Vec<u32> with 1 element
+
+let unpacked = unpack_trits(&packed, 16);  // original trits
+assert_eq!(trits, unpacked);
+```
+
+Fewer than 16 trits works too — the remaining bits are simply zero:
+
+```rust
+let small = vec![-1, 0, 1];
+let packed = pack_trits(&small);  // still 1 u32
+let restored = unpack_trits(&packed, 3);
+assert_eq!(small, restored);
+```
+
+### Full Weight Matrix Compression
+
+For a real model layer, use `pack_matrix` and `unpack_matrix`:
+
+```rust
+// Simulate a 128×64 ternary weight layer
+let rows = 128;
+let cols = 64;
+let total_params = rows * cols;  // 8,192 trits
+
+let matrix: Vec<Vec<Trit>> = (0..rows)
+    .map(|r| (0..cols).map(|c| ((r + c) % 3) as i8 - 1).collect())
+    .collect();
+
+let compressed = pack_matrix(&matrix);
+let restored = unpack_matrix(&compressed, rows, cols);
+assert_eq!(matrix, restored);
+
+// Check compression
+let original_bytes = total_params * 4;  // float32
+let compressed_bytes = compressed.len() * 4;  // u32
+let ratio = compression_ratio(original_bytes, compressed_bytes);
+println!("Compression ratio: {:.1}×", ratio);  // ~16.0×
+```
+
+### Integrity Verification
+
+After saving a checkpoint to disk and loading it back, verify that no corruption occurred:
+
+```rust
+let weights: Vec<Trit> = vec![-1, 0, 1, 1, -1, 0, 0, 1, -1];
+let compressed = pack_trits(&weights);
+
+// ... save to disk, load back later ...
+
+let loaded_compressed: Vec<u32> = compressed; // simulate load
+if verify_integrity(&weights, &loaded_compressed) {
+    println!("✓ Checkpoint integrity verified");
+} else {
+    println!("✗ Checkpoint corrupted!");
+}
+```
+
+### Weight Pruning with Top-K
+
+Sparsify a weight vector by keeping only the k highest-magnitude connections:
+
+```rust
+let mut weights = vec![1, 0, -1, 0, 1, -1, 0, 1];
+keep_top_k(&mut weights, 3);
+
+// Only 3 non-zero weights remain, rest are zeroed
+let nonzero: Vec<_> = weights.iter().filter(|&&w| w != 0).collect();
+assert_eq!(nonzero.len(), 3);
+```
+
+This is useful for fine-grained pruning: zero out the least important connections before checkpointing, making the compressed representation more efficient (since zeros pack to `01` just like non-zeros, but downstream sparse matrix ops can skip them).
+
+### Computing Compression Ratio
+
+```rust
+// A layer with 1M ternary weights
+let original_bytes = 1_000_000 * 4;       // if stored as float32
+let compressed_bytes = (1_000_000 / 16) * 4; // packed: 62,500 u32s
+let ratio = compression_ratio(original_bytes, compressed_bytes);
+assert!((ratio - 16.0).abs() < 0.01);
+```
+
+## API Reference
+
+| Function | Description |
+|----------|-------------|
+| `pack_trits(trits: &[Trit]) -> Vec<u32>` | Pack ≤16 trits into one `u32` |
+| `unpack_trits(packed: &[u32], count: usize) -> Vec<Trit>` | Unpack `count` trits from compressed form |
+| `pack_matrix(matrix: &[Vec<Trit>]) -> Vec<u32>` | Flatten and pack an entire weight matrix |
+| `unpack_matrix(packed: &[u32], rows: usize, cols: usize) -> Vec<Vec<Trit>>` | Unpack back to a row-major matrix |
+| `verify_integrity(weights: &[Trit], compressed: &[u32]) -> bool` | Lossless round-trip verification |
+| `compression_ratio(original: usize, compressed: usize) -> f64` | Compression ratio (higher = better) |
+| `keep_top_k(weights: &mut [Trit], k: usize)` | Zero out all but the k highest-magnitude weights |
+
+| Type | Description |
+|------|-------------|
+| `Trit` | Alias for `i8`: must be −1, 0, or +1 |
+
+## Ecosystem Role
+
+`ternary-checkpoint` is the **model serialization layer** in the SuperInstance ecosystem:
+
+- **Input:** Ternary weight matrices from training (weights constrained to {-1, 0, +1})
+- **Output:** Compact `Vec<u32>` suitable for disk storage, network transfer, or memory-mapped loading
+- **Depends on:** [`ternary-types`](https://github.com/SuperInstance/ternary-types) for shared type definitions
+- **Complementary to:** [`constraint-schedule`](https://github.com/SuperInstance/constraint-schedule) for scheduling distributed training checkpoints, and [`topo-merge`](https://github.com/SuperInstance/topo-merge) for merging distributed model updates
+
+In a SuperInstance deployment, models are trained with ternary constraints, checkpointed with this crate, transferred between nodes at 16× bandwidth savings, and verified on load — all losslessly.
+
+## Performance
+
+| Operation | Complexity | Notes |
+|-----------|-----------|-------|
+| `pack_trits` | O(16) | Bit shift + OR per trit |
+| `unpack_trits` | O(16) per u32 | Shift + mask per trit |
+| `pack_matrix` | O(n) | n = total trits, auto-chunked |
+| `unpack_matrix` | O(n) | Symmetric with pack |
+| `verify_integrity` | O(n) | Unpack + compare |
+| `keep_top_k` | O(n log n) | Sort by magnitude |
+
+No heap allocation in the hot path except the output `Vec`. No external dependencies beyond `ternary-types`.
+
+## License
+
+MIT
