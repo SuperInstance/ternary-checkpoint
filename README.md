@@ -1,224 +1,152 @@
 # ternary-checkpoint
 
-**Ternary model checkpointing with 16× compression and integrity verification.**
+Ternary model checkpointing with 16× compression and Merkle integrity.
 
-Neural networks with ternary weights — where each weight is exactly −1, 0, or +1 — are the backbone of efficient edge inference. But checkpointing them as 32-bit floats wastes 30 out of every 32 bits. Every weight *can only be three things*, yet we store it like it could be anything.
+## The Problem
 
-`ternary-checkpoint` exploits this with a simple but powerful insight: **2 bits can represent 4 values, and ternary only needs 3**. So we pack 16 trits into a single `u32`, achieving a 16× compression ratio over `float32` — losslessly. Every `-1`, `0`, and `+1` round-trips perfectly through pack → unpack → verify.
+Neural network checkpoints are big. A model with 100M parameters produces a 400 MB checkpoint file at f32 precision. For agent fleets running on edge hardware, this is untenable — storage is limited, network transfer is expensive, and most of that precision is wasted.
 
-## The Insight: Ternary Weights Are Already Compressed in Meaning
+Ternary quantization (weights constrained to {-1, 0, +1}) has emerged as an effective extreme quantization scheme for inference. But the checkpoint format for ternary models is usually an afterthought — a directory of numpy arrays or a raw binary blob with no integrity checking.
 
-A ternary network doesn't have 4,294,967,296 possible values per weight like a float32. It has **3**. The information content per weight is log₂(3) ≈ 1.585 bits. Storing that in 32 bits is 20× over-provisioned.
+## The Insight
 
-The packing scheme uses 2 bits per trit:
+A ternary weight needs exactly 2 bits to store (3 states: 00=-1, 01=0, 10=+1, 11=unused). A u32 holds 16 such values. That's 16× compression from f32 (32 bits per weight → 2 bits per weight). This isn't lossless — you're discarding magnitude information — but that's the whole point of ternary quantization. You already decided to throw away precision. The checkpoint format should reflect that decision end-to-end.
 
-| Trit | Binary | Meaning |
-|------|--------|---------|
-| −1 | `00` | Negative connection |
-| 0 | `01` | No connection (pruned) |
-| +1 | `10` | Positive connection |
-| — | `11` | Invalid (unused) |
+The missing piece is integrity. If a single bit flips in a 400 MB checkpoint, you get silent model corruption. A SHA-256 Merkle tree over the packed data gives you O(log n) corruption detection — check the root hash once at load time, and if it fails, drill down to the specific 256-word chunk that's corrupted.
 
-This wastes 1 of 4 codes per trit (25% overhead), but keeps packing and unpacking to simple bit shifts — no lookup tables, no branching, just `|=` and `>>`. On a 64-bit system, you can even extend to 32 trits per `u64` for further batching.
+## How It Works
 
-## Architecture
+### Pack (f32 → 2-bit trits)
+
+Each f32 weight passes through a threshold comparison:
 
 ```
-┌─────────────────────────────────────────────────────┐
-│              Ternary Weight Matrix                   │
-│  [[-1, 0, 1], [1, -1, 0], [0, 1, -1], ...]         │
-│  rows × cols trits                                   │
-└─────────────────────┬───────────────────────────────┘
-                      │
-                      ▼
-            ┌─────────────────┐
-            │  pack_matrix()  │  Flatten → chunk(16) → pack_trits()
-            │  16 trits/u32   │
-            └────────┬────────┘
-                     │
-                     ▼
-          ┌──────────────────────┐
-          │  Compressed Checkpoint│  Vec<u32>, 16× smaller than f32
-          │  [0xABCD1234, ...]   │
-          └──────────┬───────────┘
-                     │
-           ┌─────────┴─────────┐
-           ▼                   ▼
-   ┌───────────────┐   ┌────────────────┐
-   │  Verify       │   │  Unpack        │
-   │  Integrity    │   │  Matrix        │
-   │  (repack +    │   │  (u32 → trits  │
-   │   compare)    │   │   → rows)      │
-   └───────────────┘   └────────────────┘
+value > threshold  → 10 (+1)
+value < -threshold → 00 (-1)
+otherwise          → 01 (0)
 ```
 
-## Quick Start
+Trits are packed into u32 words, 16 per word:
 
-```toml
-[dependencies]
-ternary-checkpoint = "0.1"
 ```
+word = trit[0] | (trit[1] << 2) | (trit[2] << 4) | ... | (trit[15] << 30)
+```
+
+A 100M-parameter model: 100M × 2 bits = 200 Mb = 25 MB. From 400 MB.
+
+### Calibrate (optimal threshold)
+
+The default threshold of 0.2 works for weights initialized with standard methods, but the optimal threshold minimizes MSE between original and quantized weights. The `Calibrator` does a grid search over 50 threshold values between 0 and 80% of the maximum absolute weight, picking the one with lowest MSE.
+
+Scaling factors preserve magnitude information:
+- **Per-tensor**: mean |w| over all non-zero-quantized weights
+- **Per-channel**: mean |w| per output channel (for Conv2D layers where channel magnitudes vary)
+
+### Merkle Tree
+
+Packed data is split into 256-word chunks (1024 bytes each). Each chunk is SHA-256 hashed to form a leaf. Internal nodes hash the concatenation of their children. The root hash is stored in the checkpoint header.
+
+On load, the tree is rebuilt and the root is compared. A single bit flip in any chunk changes that leaf's hash, which propagates up to the root. Corrupted chunks can be identified individually via `verify_chunk()`.
+
+### Binary Format
+
+```
+┌─────────────────────────────┐
+│ TERN magic (4 bytes)        │
+│ Version: u32                │
+│ Shape: Vec<usize>           │
+│ Num trits: usize            │
+│ Threshold: f32              │
+│ Num scales: usize           │
+│ Num packed words: usize     │
+│ Scales: Vec<f32>            │
+│ Packed data: Vec<u32>       │
+│ Merkle root: [u8; 32]      │
+└─────────────────────────────┘
+```
+
+Serialized with bincode (compact, no schema overhead). The `TERN` magic header prevents loading garbage files — deserialization fails immediately if the first 4 bytes don't match.
+
+### Checkpoint Manager
+
+`CheckpointManager` handles the full lifecycle:
+- **Save**: calibrate threshold → pack → build Merkle tree → write binary + JSON metadata
+- **Load**: read binary → verify Merkle root → unpack with scales → return f32 weights
+- **Prune**: keep only the N checkpoints with lowest validation loss
+- **Best**: return the checkpoint with lowest validation loss
+
+Metadata (step, validation loss, timestamp) is stored alongside the binary as a `.meta` JSON file. Listing and sorting by loss enables the keep-N-best pruning strategy.
+
+## Code
 
 ```rust
-use ternary_checkpoint::*;
+use ternary_checkpoint::{CheckpointManager, CalibrationMode};
 
-fn main() {
-    // A small ternary weight matrix
-    let weights = vec![
-        vec![-1, 0, 1],
-        vec![1, -1, 0],
-        vec![0, 1, -1],
-    ];
+let manager = CheckpointManager::new("./checkpoints", 3)
+    .with_calibration_mode(CalibrationMode::PerChannel {
+        channel_dim: 0,
+        channel_size: 64,
+    });
 
-    // Pack into compressed form (16 trits per u32)
-    let compressed = pack_matrix(&weights);
-    println!("Packed {} trits into {} u32s", 9, compressed.len());
+// Save
+let weights: Vec<f32> = model.get_weights(); // your model's f32 weights
+let meta = manager.save(&weights, &[64, 512], step, val_loss)?;
 
-    // Verify integrity (lossless round-trip)
-    assert!(verify_integrity(
-        &[−1, 0, 1, 1, −1, 0, 0, 1, −1],
-        &compressed,
-    ));
-
-    // Unpack back to matrix
-    let restored = unpack_matrix(&compressed, 3, 3);
-    assert_eq!(weights, restored);
-    println!("Round-trip verified: lossless compression!");
+// Load best
+if let Some(best) = manager.best()? {
+    let restored: Vec<f32> = manager.load(&best.path)?;
+    model.set_weights(&restored);
 }
 ```
 
-## Tutorial
-
-### Packing Individual Trits
-
-The fundamental operation packs up to 16 trits into a single `u32`:
-
 ```rust
-use ternary_checkpoint::*;
+use ternary_checkpoint::{pack, unpack, MerkleTree};
 
-let trits = vec![-1, 0, 1, -1, 0, 1, -1, 1, 0, 0, 1, -1, 1, -1, 0, 1];
-let packed = pack_trits(&trits);  // Vec<u32> with 1 element
+// Pack 16 weights into 1 u32
+let weights: Vec<f32> = vec![1.5, -0.8, 0.01, 2.3, -1.1, 0.4, -0.02, 0.9,
+                              1.2, -0.5, 0.08, 1.7, -2.1, 0.3, -0.6, 1.0];
+let packed = pack(&weights);  // → Vec<u32> of length 1
 
-let unpacked = unpack_trits(&packed, 16);  // original trits
-assert_eq!(trits, unpacked);
+let tree = MerkleTree::build(&packed);
+let root = tree.root();
+
+// Later: verify integrity
+assert!(MerkleTree::verify(&packed, &root));
+
+// Unpack back to f32 (with scaling)
+let unpacked = unpack(&packed, 16);
+// → [1.0, -1.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0, ...]
 ```
 
-Fewer than 16 trits works too — the remaining bits are simply zero:
+## Module Map
 
-```rust
-let small = vec![-1, 0, 1];
-let packed = pack_trits(&small);  // still 1 u32
-let restored = unpack_trits(&packed, 3);
-assert_eq!(small, restored);
-```
+| Module | Responsibility | Key Types |
+|---|---|---|
+| `pack` | f32 → {-1,0,+1} → 2-bit packed u32 | `pack()`, `pack_with_threshold()`, `extract_trit()` |
+| `unpack` | u32 → trits → f32 with optional scaling | `unpack()`, `unpack_with_scale()`, `unpack_with_scales()` |
+| `calibrate` | Optimal threshold search (MSE minimization), scaling factors | `Calibrator`, `CalibrationMode` |
+| `merkle` | SHA-256 Merkle tree over 256-word chunks | `MerkleTree` |
+| `checkpoint` | Save/load/prune lifecycle, keep-N-best | `CheckpointManager`, `CheckpointMeta` |
+| `format` | Binary format with TERN magic header, version check | `TernaryCheckpoint`, `CheckpointHeader` |
 
-### Full Weight Matrix Compression
+## Design Decisions
 
-For a real model layer, use `pack_matrix` and `unpack_matrix`:
+**Why 2 bits and not 1.58?** Some ternary schemes use log₂(3) ≈ 1.58 bits via arithmetic coding. The problem: you lose random access. With 2-bit packing, extracting trit #5 from a packed word is `(word >> 10) & 0b11` — O(1), branchless, no bitstream state. Arithmetic coding requires sequential decoding. For checkpoint loading (where you need random access to specific layers), 2-bit trit extraction is strictly better despite the 27% overhead.
 
-```rust
-// Simulate a 128×64 ternary weight layer
-let rows = 128;
-let cols = 64;
-let total_params = rows * cols;  // 8,192 trits
+**Why 256-word chunks for the Merkle tree?** 256 words = 1024 bytes = a single page on most systems. This means leaf hashing never crosses a page boundary, and corrupted chunks align with filesystem blocks. Smaller chunks (e.g., 16 words) would increase the tree depth without adding detection granularity — you still need to re-transmit or re-derive the entire chunk.
 
-let matrix: Vec<Vec<Trit>> = (0..rows)
-    .map(|r| (0..cols).map(|c| ((r + c) % 3) as i8 - 1).collect())
-    .collect();
+**Why bincode and not a custom binary format?** Bincode gives us compact serialization with no framing overhead, and it's deterministic — the same struct always produces the same bytes, which is essential for reproducible Merkle roots. A custom format would need to handle endianness, alignment, and padding manually. Bincode handles all of that. The `TERN` magic header provides format identification at zero cost.
 
-let compressed = pack_matrix(&matrix);
-let restored = unpack_matrix(&compressed, rows, cols);
-assert_eq!(matrix, restored);
+**Why JSON metadata and not embedded metadata?** The `.meta` JSON file is human-readable and independently parseable. You can `cat` it, `jq` it, or list checkpoints without deserializing the binary. Embedding metadata in the binary would require partial deserialization to answer simple questions like "what's the validation loss?" The trade-off is two files per checkpoint — acceptable given that metadata files are ~200 bytes.
 
-// Check compression
-let original_bytes = total_params * 4;  // float32
-let compressed_bytes = compressed.len() * 4;  // u32
-let ratio = compression_ratio(original_bytes, compressed_bytes);
-println!("Compression ratio: {:.1}×", ratio);  // ~16.0×
-```
+**Why per-channel scaling?** In Conv2D layers, different output channels can have wildly different magnitude distributions. Channel 0 might have weights around ±0.5 while channel 31 has weights around ±3.0. A single scale factor would under-represent one and over-represent the other. Per-channel scaling (one scale per output channel) captures this variance with negligible overhead (one f32 per channel vs. one per weight).
 
-### Integrity Verification
+## Stats
 
-After saving a checkpoint to disk and loading it back, verify that no corruption occurred:
-
-```rust
-let weights: Vec<Trit> = vec![-1, 0, 1, 1, -1, 0, 0, 1, -1];
-let compressed = pack_trits(&weights);
-
-// ... save to disk, load back later ...
-
-let loaded_compressed: Vec<u32> = compressed; // simulate load
-if verify_integrity(&weights, &loaded_compressed) {
-    println!("✓ Checkpoint integrity verified");
-} else {
-    println!("✗ Checkpoint corrupted!");
-}
-```
-
-### Weight Pruning with Top-K
-
-Sparsify a weight vector by keeping only the k highest-magnitude connections:
-
-```rust
-let mut weights = vec![1, 0, -1, 0, 1, -1, 0, 1];
-keep_top_k(&mut weights, 3);
-
-// Only 3 non-zero weights remain, rest are zeroed
-let nonzero: Vec<_> = weights.iter().filter(|&&w| w != 0).collect();
-assert_eq!(nonzero.len(), 3);
-```
-
-This is useful for fine-grained pruning: zero out the least important connections before checkpointing, making the compressed representation more efficient (since zeros pack to `01` just like non-zeros, but downstream sparse matrix ops can skip them).
-
-### Computing Compression Ratio
-
-```rust
-// A layer with 1M ternary weights
-let original_bytes = 1_000_000 * 4;       // if stored as float32
-let compressed_bytes = (1_000_000 / 16) * 4; // packed: 62,500 u32s
-let ratio = compression_ratio(original_bytes, compressed_bytes);
-assert!((ratio - 16.0).abs() < 0.01);
-```
-
-## API Reference
-
-| Function | Description |
-|----------|-------------|
-| `pack_trits(trits: &[Trit]) -> Vec<u32>` | Pack ≤16 trits into one `u32` |
-| `unpack_trits(packed: &[u32], count: usize) -> Vec<Trit>` | Unpack `count` trits from compressed form |
-| `pack_matrix(matrix: &[Vec<Trit>]) -> Vec<u32>` | Flatten and pack an entire weight matrix |
-| `unpack_matrix(packed: &[u32], rows: usize, cols: usize) -> Vec<Vec<Trit>>` | Unpack back to a row-major matrix |
-| `verify_integrity(weights: &[Trit], compressed: &[u32]) -> bool` | Lossless round-trip verification |
-| `compression_ratio(original: usize, compressed: usize) -> f64` | Compression ratio (higher = better) |
-| `keep_top_k(weights: &mut [Trit], k: usize)` | Zero out all but the k highest-magnitude weights |
-
-| Type | Description |
-|------|-------------|
-| `Trit` | Alias for `i8`: must be −1, 0, or +1 |
-
-## Ecosystem Role
-
-`ternary-checkpoint` is the **model serialization layer** in the SuperInstance ecosystem:
-
-- **Input:** Ternary weight matrices from training (weights constrained to {-1, 0, +1})
-- **Output:** Compact `Vec<u32>` suitable for disk storage, network transfer, or memory-mapped loading
-- **Depends on:** [`ternary-types`](https://github.com/SuperInstance/ternary-types) for shared type definitions
-- **Complementary to:** [`constraint-schedule`](https://github.com/SuperInstance/constraint-schedule) for scheduling distributed training checkpoints, and [`topo-merge`](https://github.com/SuperInstance/topo-merge) for merging distributed model updates
-
-In a SuperInstance deployment, models are trained with ternary constraints, checkpointed with this crate, transferred between nodes at 16× bandwidth savings, and verified on load — all losslessly.
-
-## Performance
-
-| Operation | Complexity | Notes |
-|-----------|-----------|-------|
-| `pack_trits` | O(16) | Bit shift + OR per trit |
-| `unpack_trits` | O(16) per u32 | Shift + mask per trit |
-| `pack_matrix` | O(n) | n = total trits, auto-chunked |
-| `unpack_matrix` | O(n) | Symmetric with pack |
-| `verify_integrity` | O(n) | Unpack + compare |
-| `keep_top_k` | O(n log n) | Sort by magnitude |
-
-No heap allocation in the hot path except the output `Vec`. No external dependencies beyond `ternary-types`.
+- 46 tests, all passing
+- Pure safe Rust, zero unsafe blocks
+- Dependencies: `serde`, `serde_json`, `thiserror`, `sha2`, `bincode`
+- Dev dependencies: `tempfile`
 
 ## License
 
